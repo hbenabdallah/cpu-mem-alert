@@ -9,7 +9,10 @@ A small Linux desktop monitor that pops up an alert when CPU or memory usage sta
 - An alert fires after usage stays above the threshold for 3 samples in a row, then waits 5 minutes before alerting again.
 - The popup sits in the top-right corner, closes on click, and disappears after 15 seconds.
 - **Show programs to close** opens a list of your heaviest processes (live CPU + memory). Tick some and press
-  **Close selected** (asks them to quit) or **Force kill** (stops them immediately). Only your own processes are
+  **Close selected** (asks them to quit) or **Force kill** (stops them immediately). The **Details** column says what
+  each process is: the project a Claude Code / Junie / dev tool runs in, the Docker container, or the role of a
+  Chrome/Electron process (tab, extension, GPU…). Chrome does not reveal which tab a process belongs to; press
+  Shift+Esc in Chrome for that. Hover a row for the full command and folder. Only your own processes are
   listed; root processes, core desktop processes and FortiClient are never shown. Open it any time with
   `cpu-alert-popup --candidates`.
 

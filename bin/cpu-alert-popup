@@ -5,7 +5,9 @@
 #        cpu-alert-popup --candidates   (only open the list of programs to close)
 # Env: CPU_ALERT_CRITICAL (%, default 95), CPU_ALERT_POPUP_TIMEOUT (s, default 15)
 import os
+import re
 import signal
+import subprocess
 import sys
 import time
 
@@ -118,7 +120,91 @@ def list_candidates(sample=0.5):
         rows.append({"pid": pid, "name": comm, "cpu": cpu, "rss": rss, "score": cpu + mem,
                      "age": format_age(age), "cmd": cmdline or comm})
     rows.sort(key=lambda r: r["score"], reverse=True)
-    return rows[:CANDIDATE_LIMIT]
+    rows = rows[:CANDIDATE_LIMIT]
+    containers = docker_names()
+    for r in rows:
+        r["cwd"] = read_cwd(r["pid"])
+        r["detail"] = describe(r["name"], r["cmd"], r["cwd"], container_of(r["pid"], containers))
+    return rows
+
+
+def read_cwd(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return ""
+
+
+def docker_names():
+    """Maps short container id -> name; empty if docker is missing or not allowed."""
+    try:
+        out = subprocess.run(["docker", "ps", "--format", "{{.ID}} {{.Names}}"],
+                             capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return dict(line.split(" ", 1) for line in out.splitlines() if " " in line)
+
+
+def container_of(pid, containers):
+    try:
+        with open(f"/proc/{pid}/cgroup") as f:
+            match = re.search(r"docker[-/]([0-9a-f]{12})", f.read())
+    except OSError:
+        return ""
+    if not match:
+        return ""
+    return containers.get(match.group(1), match.group(1))
+
+
+# Chromium/Electron helper processes, keyed by their --type / --utility-sub-type flag
+PROCESS_ROLES = {
+    "gpu-process": "graphics (GPU)",
+    "zygote": "process launcher",
+    "network.mojom.NetworkService": "network service",
+    "storage.mojom.StorageService": "storage service",
+    "audio.mojom.AudioService": "audio service",
+}
+APP_NAMES = {
+    "chrome": "Chrome", "chromium": "Chromium", "claude-desktop": "Claude desktop",
+    "code": "VS Code", "slack": "Slack", "discord": "Discord",
+}
+
+
+def describe(comm, cmdline, cwd, container):
+    """Human-readable 'what is this process' text for the Details column."""
+    home = os.path.expanduser("~")
+    project = os.path.basename(cwd) if cwd and cwd.startswith(home + "/") else ""
+    in_project = f" · project {project}" if project else ""
+    flags = dict(re.findall(r"--(type|utility-sub-type)=(\S+)", cmdline))
+
+    if comm in APP_NAMES:
+        app = APP_NAMES[comm]
+        kind = flags.get("type")
+        if not kind:
+            return f"{app} · main process (closing it closes all windows)"
+        if kind == "renderer" and "--extension-process" in cmdline:
+            return f"{app} · extension"
+        if kind == "renderer":
+            if comm in ("chrome", "chromium"):
+                return f"{app} · tab or site (press Shift+Esc in {app} to see which)"
+            return f"{app} · window content"
+        role = PROCESS_ROLES.get(flags.get("utility-sub-type", kind), "helper")
+        return f"{app} · {role}"
+    if comm == "claude":
+        source = "Claude Code (from desktop app)" if "claude-code/" in cmdline else "Claude Code session"
+        return source + in_project
+    if comm == "junie":
+        return "JetBrains Junie AI agent" + in_project
+    if comm.startswith("embeddings-ser"):
+        return "PhpStorm AI semantic search index"
+    if comm in ("phpstorm", "idea", "webstorm", "pycharm", "goland"):
+        return "JetBrains IDE (all open projects)"
+
+    args = cmdline.split()
+    short = " ".join(os.path.basename(a) if "/" in a else a for a in args[:4]) if args else comm
+    if container:
+        return f"{short} · Docker container {container}"
+    return short + in_project
 
 
 def send_signal(pids, sig):
@@ -134,7 +220,7 @@ def send_signal(pids, sig):
 
 class CandidatesWindow(Gtk.Window):
     # ListStore columns
-    CHECK, NAME, PID, CPU, MEM, AGE, CMD = range(7)
+    CHECK, NAME, PID, CPU, MEM, AGE, DETAIL, TOOLTIP = range(8)
 
     def __init__(self):
         super().__init__(title="Programs to close")
@@ -149,19 +235,19 @@ class CandidatesWindow(Gtk.Window):
         hint.set_line_wrap(True)
         box.pack_start(hint, False, False, 0)
 
-        self.store = Gtk.ListStore(bool, str, int, str, str, str, str)
+        self.store = Gtk.ListStore(bool, str, int, str, str, str, str, str)
         view = Gtk.TreeView(model=self.store)
-        view.set_tooltip_column(self.CMD)
+        view.set_tooltip_column(self.TOOLTIP)
         toggle = Gtk.CellRendererToggle()
         toggle.connect("toggled", self.on_toggled)
         view.append_column(Gtk.TreeViewColumn("", toggle, active=self.CHECK))
         for title, col in (("Program", self.NAME), ("PID", self.PID), ("CPU", self.CPU),
-                           ("Memory", self.MEM), ("Running", self.AGE), ("Command", self.CMD)):
+                           ("Memory", self.MEM), ("Running", self.AGE), ("Details", self.DETAIL)):
             cell = Gtk.CellRendererText()
-            if col == self.CMD:
+            if col == self.DETAIL:
                 cell.set_property("ellipsize", 3)  # Pango.EllipsizeMode.END
             column = Gtk.TreeViewColumn(title, cell, text=col)
-            column.set_expand(col == self.CMD)
+            column.set_expand(col == self.DETAIL)
             view.append_column(column)
         scroll = Gtk.ScrolledWindow()
         scroll.add(view)
@@ -184,8 +270,9 @@ class CandidatesWindow(Gtk.Window):
     def refresh(self):
         self.store.clear()
         for r in list_candidates():
+            tooltip = GLib.markup_escape_text(f"{r['detail']}\n\nFolder: {r['cwd'] or '?'}\n{r['cmd'][:400]}")
             self.store.append([False, r["name"], r["pid"], f"{r['cpu']:.0f}%",
-                               f"{r['rss'] / 1024 ** 3:.2f} GiB", r["age"], r["cmd"]])
+                               f"{r['rss'] / 1024 ** 3:.2f} GiB", r["age"], r["detail"], tooltip])
 
     def on_toggled(self, _cell, path):
         self.store[path][self.CHECK] = not self.store[path][self.CHECK]
