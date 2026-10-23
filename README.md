@@ -1,6 +1,8 @@
 # cpu-mem-alert
 
-A small Linux desktop monitor that pops up an alert when CPU or memory usage stays high.
+A small Linux desktop monitor that pops up an alert when CPU or memory usage stays high, and helps you find and close the programs causing it.
+
+## Alert popup
 
 ![popup](screenshot.png)
 
@@ -8,13 +10,31 @@ A small Linux desktop monitor that pops up an alert when CPU or memory usage sta
 - Each value is green below the threshold, orange above it, and **red at 95%+**. The border takes the worst color.
 - An alert fires after usage stays above the threshold for 3 samples in a row, then waits 5 minutes before alerting again.
 - The popup sits in the top-right corner, closes on click, and disappears after 15 seconds.
-- **Show programs to close** opens a list of your heaviest processes (live CPU + memory). Tick some and press
-  **Close selected** (asks them to quit) or **Force kill** (stops them immediately). The **Details** column says what
-  each process is: the project a Claude Code / Junie / dev tool runs in, the Docker container, or the role of a
-  Chrome/Electron process (tab, extension, GPU…). Chrome does not reveal which tab a process belongs to; press
-  Shift+Esc in Chrome for that. Hover a row for the full command and folder. Only your own processes are
-  listed; root processes, core desktop processes and FortiClient are never shown. Open it any time with
-  `cpu-alert-popup --candidates`.
+
+## Programs to close
+
+Click **Show programs to close** in the popup to see what is weighing on your machine and free it up in a few clicks.
+
+![programs to close](process-list.png)
+
+- Lists your 15 heaviest processes right now, ranked by live CPU + memory.
+- The **Details** column says what each process actually is:
+  - Claude Code, Junie or any dev tool: the **project** it runs in
+  - Processes inside Docker: the **container** name
+  - Chrome / Electron apps: the **role** of the process (tab, extension, GPU, network, main process…)
+  - IDEs and their helpers (e.g. PhpStorm's AI semantic search index)
+- Hover a row for the full command and folder.
+- Tick processes, then **Close selected** (asks them to quit cleanly) or **Force kill** (stops them immediately, may
+  lose unsaved work). The list refreshes on its own afterwards.
+- Safe by design: only your own processes are listed. Root processes (security agents, system services), core desktop
+  processes (GNOME Shell, audio…), FortiClient and the monitor itself are never shown.
+- Chrome does not reveal which tab a process belongs to; press **Shift+Esc** in Chrome to see that.
+
+Open it any time, without waiting for an alert:
+
+```bash
+cpu-alert-popup --candidates
+```
 
 ## Requirements
 
@@ -46,11 +66,23 @@ curl -fsSL https://raw.githubusercontent.com/hbenabdallah/cpu-mem-alert/main/ins
 
 (or `./install.sh --uninstall` from a clone)
 
-## Test the popup
+## Test it
+
+Show the popup with sample values:
 
 ```bash
 ~/.local/bin/cpu-alert-popup 97 75 $'97.0%\tphp' 82 75 $'3.2G\tphpstorm' "26 / 31 GiB used"
 ```
+
+Or trigger a real alert: run a quick monitor in one terminal and load every core in another.
+
+```bash
+CPU_ALERT_SUSTAIN=1 CPU_ALERT_COOLDOWN=30 ~/.local/bin/cpu-alert     # terminal A
+for i in $(seq $(nproc)); do yes > /dev/null & done                  # terminal B
+```
+
+A red popup appears within a few seconds; open **Show programs to close**, tick the `yes` processes and close them
+(or run `pkill yes`).
 
 ## Configuration
 
