@@ -1,0 +1,11 @@
+[Unit]
+Description=Notify when CPU or memory usage is high
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/cpu-alert
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target

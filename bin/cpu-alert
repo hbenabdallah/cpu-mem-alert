@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Desktop popup when total CPU or memory usage stays above a threshold.
+# The popup shows a Processor column and a Memory column; it turns red at CPU_ALERT_CRITICAL.
+# Env: CPU_ALERT_THRESHOLD (%, default 75), MEM_ALERT_THRESHOLD (%, default 75),
+#      CPU_ALERT_CRITICAL (%, default 95), CPU_ALERT_INTERVAL (s, default 5),
+#      CPU_ALERT_SUSTAIN (consecutive samples, default 3), CPU_ALERT_COOLDOWN (s, default 300)
+
+THRESHOLD=${CPU_ALERT_THRESHOLD:-75}
+MEM_THRESHOLD=${MEM_ALERT_THRESHOLD:-75}
+INTERVAL=${CPU_ALERT_INTERVAL:-5}
+SUSTAIN=${CPU_ALERT_SUSTAIN:-3}
+COOLDOWN=${CPU_ALERT_COOLDOWN:-300}
+POPUP="$(dirname "$(readlink -f "$0")")/cpu-alert-popup"
+
+read_cpu() {
+    read -r _ user nice system idle iowait irq softirq steal _ < /proc/stat
+    echo $((user + nice + system + irq + softirq + steal)) $((idle + iowait))
+}
+
+# Prints: used% used_mib total_mib
+read_mem() {
+    awk '/^MemTotal:/ {t=$2} /^MemAvailable:/ {a=$2}
+         END {printf "%d %d %d\n", 100 * (t - a) / t, (t - a) / 1024, t / 1024}' /proc/meminfo
+}
+
+read -r prev_busy prev_idle < <(read_cpu)
+cpu_hits=0
+mem_hits=0
+last_alert=0
+
+while sleep "$INTERVAL"; do
+    read -r busy idle < <(read_cpu)
+    d_busy=$((busy - prev_busy))
+    d_total=$((d_busy + idle - prev_idle))
+    prev_busy=$busy prev_idle=$idle
+    ((d_total > 0)) || continue
+    usage=$((100 * d_busy / d_total))
+    read -r mem_usage mem_used mem_total < <(read_mem)
+
+    if ((usage >= THRESHOLD)); then cpu_hits=$((cpu_hits + 1)); else cpu_hits=0; fi
+    if ((mem_usage >= MEM_THRESHOLD)); then mem_hits=$((mem_hits + 1)); else mem_hits=0; fi
+
+    now=$(date +%s)
+    if ((cpu_hits >= SUSTAIN || mem_hits >= SUSTAIN)) && ((now - last_alert >= COOLDOWN)); then
+        cpu_procs=$(ps -eo %cpu,comm --sort=-%cpu --no-headers | head -5 | awk '{printf "%s%%\t%s\n", $1, $2}')
+        mem_procs=$(ps -eo rss,comm --sort=-rss --no-headers | head -5 | awk '{printf "%.1fG\t%s\n", $1 / 1048576, $2}')
+        mem_detail=$(awk -v u="$mem_used" -v t="$mem_total" 'BEGIN {printf "%.1f / %.1f GiB used", u / 1024, t / 1024}')
+        "$POPUP" "$usage" "$THRESHOLD" "$cpu_procs" "$mem_usage" "$MEM_THRESHOLD" "$mem_procs" "$mem_detail" &
+        echo "$(date '+%F %T') CPU ${usage}% MEM ${mem_usage}%"$'\n'"$cpu_procs"$'\n'"$mem_procs"
+        last_alert=$now
+    fi
+done

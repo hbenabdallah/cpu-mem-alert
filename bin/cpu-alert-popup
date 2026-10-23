@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+# Notification-style popup with a CPU column and a Memory column.
+# Usage: cpu-alert-popup CPU% CPU_THRESHOLD CPU_PROCS MEM% MEM_THRESHOLD MEM_PROCS MEM_DETAIL
+#   *_PROCS: newline-separated "value<TAB>name" lines
+# Env: CPU_ALERT_CRITICAL (%, default 95), CPU_ALERT_POPUP_TIMEOUT (s, default 15)
+import os
+import sys
+
+os.environ.setdefault("GDK_BACKEND", "x11")  # Wayland forbids self-positioning; XWayland allows it
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import GLib, Gtk, Gdk
+
+CRITICAL = int(os.environ.get("CPU_ALERT_CRITICAL", 95))
+TIMEOUT = int(os.environ.get("CPU_ALERT_POPUP_TIMEOUT", 15))
+
+COLORS = {"ok": "#3d9a50", "warn": "#e08a00", "crit": "#d32f2f"}
+
+CSS = b"""
+window { background: #2b2b2b; border-radius: 10px; }
+.frame { border: 3px solid @accent; border-radius: 10px; padding: 12px 14px; }
+.col { min-width: 210px; }
+.title { font-weight: bold; font-size: 11pt; color: #ffffff; }
+.value { font-weight: bold; font-size: 20pt; }
+.detail { color: #bbbbbb; font-size: 9pt; }
+.procs { font-family: monospace; font-size: 9pt; color: #dddddd; }
+.sep { background: #555555; min-width: 1px; }
+"""
+
+
+def level(value, threshold):
+    if value >= CRITICAL:
+        return "crit"
+    return "warn" if value >= threshold else "ok"
+
+
+def column(title, value, threshold, procs, detail):
+    lvl = level(value, threshold)
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    box.get_style_context().add_class("col")
+
+    head = Gtk.Label(xalign=0)
+    head.get_style_context().add_class("title")
+    head.set_text(title)
+    box.pack_start(head, False, False, 0)
+
+    val = Gtk.Label(xalign=0)
+    val.get_style_context().add_class("value")
+    val.set_markup(f'<span foreground="{COLORS[lvl]}">{value}%</span>')
+    box.pack_start(val, False, False, 0)
+
+    sub = Gtk.Label(xalign=0)
+    sub.get_style_context().add_class("detail")
+    sub.set_text(detail or f"threshold {threshold}%")
+    box.pack_start(sub, False, False, 4)
+
+    lines = []
+    for line in procs.splitlines():
+        amount, _, name = line.partition("\t")
+        lines.append(f"{amount:>7}  {name[:18]}")
+    plist = Gtk.Label(xalign=0, yalign=0)
+    plist.get_style_context().add_class("procs")
+    plist.set_text("\n".join(lines))
+    box.pack_start(plist, False, False, 0)
+    return box, lvl
+
+
+def main():
+    cpu, cpu_thr, cpu_procs, mem, mem_thr, mem_procs, mem_detail = sys.argv[1:8]
+    cpu, cpu_thr, mem, mem_thr = int(cpu), int(cpu_thr), int(mem), int(mem_thr)
+
+    cpu_col, cpu_lvl = column("Processor", cpu, cpu_thr, cpu_procs, f"threshold {cpu_thr}%")
+    mem_col, mem_lvl = column("Memory", mem, mem_thr, mem_procs, mem_detail)
+    worst = max((cpu_lvl, mem_lvl), key=["ok", "warn", "crit"].index)
+
+    provider = Gtk.CssProvider()
+    provider.load_from_data(CSS.replace(b"@accent", COLORS[worst].encode()))
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+    )
+
+    win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+    win.set_decorated(False)
+    win.set_keep_above(True)
+    win.set_accept_focus(False)
+    win.set_skip_taskbar_hint(True)
+    win.set_skip_pager_hint(True)
+    win.set_type_hint(Gdk.WindowTypeHint.NOTIFICATION)
+
+    frame = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+    frame.get_style_context().add_class("frame")
+    frame.pack_start(cpu_col, True, True, 0)
+    sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+    sep.get_style_context().add_class("sep")
+    frame.pack_start(sep, False, False, 0)
+    frame.pack_start(mem_col, True, True, 0)
+
+    events = Gtk.EventBox()
+    events.add(frame)
+    events.connect("button-press-event", lambda *_: Gtk.main_quit())
+    win.add(events)
+    win.connect("destroy", Gtk.main_quit)
+
+    win.show_all()
+    geo = Gdk.Display.get_default().get_primary_monitor() or Gdk.Display.get_default().get_monitor(0)
+    area = geo.get_workarea()
+    width, _ = win.get_size()
+    win.move(area.x + area.width - width - 16, area.y + 16)
+
+    GLib.timeout_add_seconds(TIMEOUT, Gtk.main_quit)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
