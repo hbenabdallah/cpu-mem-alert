@@ -8,6 +8,10 @@ A small Linux desktop monitor that pops up an alert when CPU or memory usage sta
 - Each value is green below the threshold, orange above it, and **red at 95%+**. The border takes the worst color.
 - An alert fires after usage stays above the threshold for 3 samples in a row, then waits 5 minutes before alerting again.
 - The popup sits in the top-right corner, closes on click, and disappears after 15 seconds.
+- **Show programs to close** opens a list of your heaviest processes (live CPU + memory). Tick some and press
+  **Close selected** (asks them to quit) or **Force kill** (stops them immediately). Only your own processes are
+  listed; root processes, core desktop processes and FortiClient are never shown. Open it any time with
+  `cpu-alert-popup --candidates`.
 
 ## Requirements
 

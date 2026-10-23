@@ -2,9 +2,12 @@
 # Notification-style popup with a CPU column and a Memory column.
 # Usage: cpu-alert-popup CPU% CPU_THRESHOLD CPU_PROCS MEM% MEM_THRESHOLD MEM_PROCS MEM_DETAIL
 #   *_PROCS: newline-separated "value<TAB>name" lines
+#        cpu-alert-popup --candidates   (only open the list of programs to close)
 # Env: CPU_ALERT_CRITICAL (%, default 95), CPU_ALERT_POPUP_TIMEOUT (s, default 15)
 import os
+import signal
 import sys
+import time
 
 os.environ.setdefault("GDK_BACKEND", "x11")  # Wayland forbids self-positioning; XWayland allows it
 
@@ -27,7 +30,175 @@ window { background: #2b2b2b; border-radius: 10px; }
 .detail { color: #bbbbbb; font-size: 9pt; }
 .procs { font-family: monospace; font-size: 9pt; color: #dddddd; }
 .sep { background: #555555; min-width: 1px; }
+.more { margin-top: 10px; }
 """
+
+# Desktop-session processes that should never be offered for closing.
+PROTECTED_PREFIXES = (
+    "gnome-shell", "gnome-session", "gnome-keyring", "gsd-", "Xwayland", "mutter", "systemd",
+    "dbus-", "pipewire", "wireplumber", "pulseaudio", "ibus-", "at-spi", "xdg-", "gvfs",
+    "cpu-alert", "evolution-", "tracker-miner", "FortiClient",
+)
+CANDIDATE_LIMIT = 15
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+
+
+def read_proc(pid):
+    """Returns (comm, ppid, cpu_ticks, start_ticks, rss_bytes, uid, cmdline) or None if gone."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+        with open(f"/proc/{pid}/status") as f:
+            uid = next(int(l.split()[1]) for l in f if l.startswith("Uid:"))
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+    except (OSError, StopIteration):
+        return None
+    comm = stat[stat.index("(") + 1:stat.rindex(")")]
+    fields = stat[stat.rindex(")") + 2:].split()
+    # fields[0] is state (field 3 in proc(5)); utime/stime/starttime/rss are 14/15/22/24
+    ticks = int(fields[11]) + int(fields[12])
+    return comm, int(fields[1]), ticks, int(fields[19]), int(fields[21]) * PAGE_SIZE, uid, cmdline
+
+
+def is_protected(comm, cmdline):
+    # Scripts show up as their interpreter (bash, python3), so also check the script name
+    script = os.path.basename(cmdline.split(" ", 2)[1]) if " " in cmdline else ""
+    return comm.startswith(PROTECTED_PREFIXES) or script.startswith(PROTECTED_PREFIXES)
+
+
+def own_ancestors():
+    pids, pid = set(), os.getpid()
+    while pid > 1:
+        pids.add(pid)
+        info = read_proc(pid)
+        if not info:
+            break
+        pid = info[1]
+    return pids
+
+
+def format_age(seconds):
+    if seconds >= 86400:
+        return f"{seconds // 86400}d {seconds % 86400 // 3600}h"
+    if seconds >= 3600:
+        return f"{seconds // 3600}h {seconds % 3600 // 60}m"
+    return f"{seconds // 60}m"
+
+
+def list_candidates(sample=0.5):
+    """User-owned processes using the most memory + CPU, measured over `sample` seconds."""
+    uid, skip = os.getuid(), own_ancestors()
+    with open("/proc/meminfo") as f:
+        mem_total = int(f.readline().split()[1]) * 1024
+    with open("/proc/uptime") as f:
+        uptime = float(f.read().split()[0])
+
+    def snapshot():
+        procs = {}
+        for name in os.listdir("/proc"):
+            if name.isdigit() and int(name) not in skip:
+                info = read_proc(int(name))
+                if info and info[5] == uid and not is_protected(info[0], info[6]):
+                    procs[int(name)] = info
+        return procs
+
+    before = snapshot()
+    time.sleep(sample)
+    rows = []
+    for pid, (comm, _, ticks, start, rss, _, cmdline) in snapshot().items():
+        if pid not in before:
+            continue
+        cpu = 100 * (ticks - before[pid][2]) / CLK_TCK / sample
+        mem = 100 * rss / mem_total
+        if rss < 50 * 1024 * 1024 and cpu < 1:
+            continue
+        age = int(uptime - start / CLK_TCK)
+        rows.append({"pid": pid, "name": comm, "cpu": cpu, "rss": rss, "score": cpu + mem,
+                     "age": format_age(age), "cmd": cmdline or comm})
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    return rows[:CANDIDATE_LIMIT]
+
+
+def send_signal(pids, sig):
+    sent = 0
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+            sent += 1
+        except ProcessLookupError:
+            pass
+    return sent
+
+
+class CandidatesWindow(Gtk.Window):
+    # ListStore columns
+    CHECK, NAME, PID, CPU, MEM, AGE, CMD = range(7)
+
+    def __init__(self):
+        super().__init__(title="Programs to close")
+        self.set_default_size(820, 460)
+        self.set_keep_above(True)
+        self.set_position(Gtk.WindowPosition.CENTER)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=12)
+        hint = Gtk.Label(xalign=0)
+        hint.set_markup("Your heaviest processes right now. <b>Close</b> asks a program to quit; "
+                        "<b>Force kill</b> stops it immediately and may lose unsaved work.")
+        hint.set_line_wrap(True)
+        box.pack_start(hint, False, False, 0)
+
+        self.store = Gtk.ListStore(bool, str, int, str, str, str, str)
+        view = Gtk.TreeView(model=self.store)
+        view.set_tooltip_column(self.CMD)
+        toggle = Gtk.CellRendererToggle()
+        toggle.connect("toggled", self.on_toggled)
+        view.append_column(Gtk.TreeViewColumn("", toggle, active=self.CHECK))
+        for title, col in (("Program", self.NAME), ("PID", self.PID), ("CPU", self.CPU),
+                           ("Memory", self.MEM), ("Running", self.AGE), ("Command", self.CMD)):
+            cell = Gtk.CellRendererText()
+            if col == self.CMD:
+                cell.set_property("ellipsize", 3)  # Pango.EllipsizeMode.END
+            column = Gtk.TreeViewColumn(title, cell, text=col)
+            column.set_expand(col == self.CMD)
+            view.append_column(column)
+        scroll = Gtk.ScrolledWindow()
+        scroll.add(view)
+        box.pack_start(scroll, True, True, 0)
+
+        actions = Gtk.Box(spacing=8)
+        self.status = Gtk.Label(xalign=0)
+        actions.pack_start(self.status, True, True, 0)
+        for label, handler in (("Refresh", lambda *_: self.refresh()),
+                               ("Force kill", lambda *_: self.close_selected(signal.SIGKILL)),
+                               ("Close selected", lambda *_: self.close_selected(signal.SIGTERM))):
+            button = Gtk.Button(label=label)
+            button.connect("clicked", handler)
+            actions.pack_start(button, False, False, 0)
+        box.pack_start(actions, False, False, 0)
+
+        self.add(box)
+        self.refresh()
+
+    def refresh(self):
+        self.store.clear()
+        for r in list_candidates():
+            self.store.append([False, r["name"], r["pid"], f"{r['cpu']:.0f}%",
+                               f"{r['rss'] / 1024 ** 3:.2f} GiB", r["age"], r["cmd"]])
+
+    def on_toggled(self, _cell, path):
+        self.store[path][self.CHECK] = not self.store[path][self.CHECK]
+
+    def close_selected(self, sig):
+        pids = [row[self.PID] for row in self.store if row[self.CHECK]]
+        if not pids:
+            self.status.set_text("Tick the processes to close first.")
+            return
+        sent = send_signal(pids, sig)
+        action = "Force-killed" if sig == signal.SIGKILL else "Asked to close"
+        self.status.set_text(f"{action} {sent} process(es).")
+        GLib.timeout_add(1500, lambda: self.refresh() and False)
 
 
 def level(value, threshold):
@@ -67,7 +238,18 @@ def column(title, value, threshold, procs, detail):
     return box, lvl
 
 
+def show_candidates():
+    win = CandidatesWindow()
+    win.connect("destroy", Gtk.main_quit)
+    win.show_all()
+
+
 def main():
+    if sys.argv[1:] == ["--candidates"]:
+        show_candidates()
+        Gtk.main()
+        return
+
     cpu, cpu_thr, cpu_procs, mem, mem_thr, mem_procs, mem_detail = sys.argv[1:8]
     cpu, cpu_thr, mem, mem_thr = int(cpu), int(cpu_thr), int(mem), int(mem_thr)
 
@@ -89,19 +271,32 @@ def main():
     win.set_skip_pager_hint(True)
     win.set_type_hint(Gdk.WindowTypeHint.NOTIFICATION)
 
-    frame = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
-    frame.get_style_context().add_class("frame")
-    frame.pack_start(cpu_col, True, True, 0)
+    columns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
+    columns.pack_start(cpu_col, True, True, 0)
     sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
     sep.get_style_context().add_class("sep")
-    frame.pack_start(sep, False, False, 0)
-    frame.pack_start(mem_col, True, True, 0)
+    columns.pack_start(sep, False, False, 0)
+    columns.pack_start(mem_col, True, True, 0)
+
+    def open_candidates(_button):
+        GLib.source_remove(timer)
+        win.disconnect(quit_handler)
+        win.destroy()
+        show_candidates()
+
+    more = Gtk.Button(label="Show programs to close")
+    more.get_style_context().add_class("more")
+    more.connect("clicked", open_candidates)
+    frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    frame.get_style_context().add_class("frame")
+    frame.pack_start(columns, True, True, 0)
+    frame.pack_start(more, False, False, 0)
 
     events = Gtk.EventBox()
     events.add(frame)
     events.connect("button-press-event", lambda *_: Gtk.main_quit())
     win.add(events)
-    win.connect("destroy", Gtk.main_quit)
+    quit_handler = win.connect("destroy", Gtk.main_quit)
 
     win.show_all()
     geo = Gdk.Display.get_default().get_primary_monitor() or Gdk.Display.get_default().get_monitor(0)
@@ -109,7 +304,7 @@ def main():
     width, _ = win.get_size()
     win.move(area.x + area.width - width - 16, area.y + 16)
 
-    GLib.timeout_add_seconds(TIMEOUT, Gtk.main_quit)
+    timer = GLib.timeout_add_seconds(TIMEOUT, Gtk.main_quit)
     Gtk.main()
 
 
