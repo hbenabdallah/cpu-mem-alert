@@ -18,6 +18,12 @@ A small Linux desktop monitor that pops up an alert when CPU or memory usage sta
 ## Install
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/hbenabdallah/cpu-mem-alert/main/install.sh | bash
+```
+
+Or from a clone:
+
+```bash
 git clone https://github.com/hbenabdallah/cpu-mem-alert.git
 cd cpu-mem-alert
 ./install.sh
@@ -25,7 +31,13 @@ cd cpu-mem-alert
 
 This copies the scripts to `~/.local/bin`, installs a systemd user service, and starts it. No root needed.
 
-Uninstall with `./install.sh --uninstall`.
+Uninstall:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hbenabdallah/cpu-mem-alert/main/install.sh | bash -s -- --uninstall
+```
+
+(or `./install.sh --uninstall` from a clone)
 
 ## Test the popup
 
