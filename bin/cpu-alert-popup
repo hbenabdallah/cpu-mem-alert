@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # Notification-style popup with a CPU column and a Memory column.
-# Usage: cpu-alert-popup CPU% CPU_THRESHOLD CPU_PROCS MEM% MEM_THRESHOLD MEM_PROCS MEM_DETAIL
-#   *_PROCS: newline-separated "value<TAB>name" lines
+# Usage: cpu-alert-popup CPU% CPU_THRESHOLD CPU_PROCS MEM% MEM_THRESHOLD MEM_PROCS MEM_DETAIL [NET% NET_PROCS NET_DETAIL]
+#   *_PROCS: newline-separated "value<TAB>name" lines; NET_PROCS lists programs over the per-program limit
 #        cpu-alert-popup --candidates   (only open the list of programs to close)
-# Env: CPU_ALERT_CRITICAL (%, default 95), CPU_ALERT_POPUP_TIMEOUT (s, default 15)
+#        cpu-alert-popup --net-procs DOWN_LIMIT UP_LIMIT   (print programs above these bytes/s, NET_PROCS format)
+# Env: CPU_ALERT_CRITICAL (%, default 95), CPU_ALERT_POPUP_TIMEOUT (s, default 15),
+#      NET_ALERT_SPEED / NET_ALERT_UPLOAD_SPEED (MB/s, default: the peak the monitor learned)
 import os
 import re
 import signal
@@ -42,6 +44,9 @@ PROTECTED_PREFIXES = (
     "cpu-alert", "evolution-", "tracker-miner", "FortiClient",
 )
 CANDIDATE_LIMIT = 15
+MIB = 1024 * 1024
+SPEED_FILE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                          "cpu-alert", "net-speed")
 CLK_TCK = os.sysconf("SC_CLK_TCK")
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 
@@ -62,6 +67,103 @@ def read_proc(pid):
     # fields[0] is state (field 3 in proc(5)); utime/stime/starttime/rss are 14/15/22/24
     ticks = int(fields[11]) + int(fields[12])
     return comm, int(fields[1]), ticks, int(fields[19]), int(fields[21]) * PAGE_SIZE, uid, cmdline
+
+
+def internet_bytes():
+    """(received, sent) bytes so far on the interface of the lowest-metric default route."""
+    with open("/proc/net/route") as f:
+        routes = [l.split() for l in f.readlines()[1:]]
+    defaults = sorted((int(r[6]), r[0]) for r in routes if r[1] == "00000000")
+    if not defaults:
+        return 0, 0
+    with open("/proc/net/dev") as f:
+        for line in f.readlines()[2:]:
+            name, data = line.split(":", 1)
+            if name.strip() == defaults[0][1]:
+                fields = data.split()
+                return int(fields[0]), int(fields[8])
+    return 0, 0
+
+
+def internet_speed():
+    """(down, up) bytes/s the connection can do: set by hand, else the peak the monitor has seen."""
+    try:
+        with open(SPEED_FILE) as f:
+            down, up = (int(v) for v in f.read().split())
+    except (OSError, ValueError):
+        down = up = 0
+    if os.environ.get("NET_ALERT_SPEED"):
+        down = int(float(os.environ["NET_ALERT_SPEED"]) * MIB)
+    if os.environ.get("NET_ALERT_UPLOAD_SPEED"):
+        up = int(float(os.environ["NET_ALERT_UPLOAD_SPEED"]) * MIB)
+    return down, up
+
+
+def run_ss(*args):
+    try:
+        return subprocess.run(["ss", "-H", *args], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def tcp_counters():
+    """Maps (local, peer) -> (pid, name, received, sent) for the TCP sockets of this user's processes."""
+    socks, key = {}, None
+    for line in run_ss("-tinp").splitlines():
+        if not line[:1].isspace():
+            owner = re.search(r'\(\("([^"]+)",pid=(\d+)', line)
+            parts = line.split()
+            key = (parts[3], parts[4]) if owner else None
+            if key:
+                socks[key] = (int(owner[2]), owner[1], 0, 0)
+        elif key:
+            rx = re.search(r"bytes_received:(\d+)", line)
+            tx = re.search(r"bytes_acked:(\d+)", line)
+            socks[key] = socks[key][:2] + (int(rx[1]) if rx else 0, int(tx[1]) if tx else 0)
+    return socks
+
+
+def tcp_rates(before, after, seconds):
+    """Maps pid -> [name, down, up] in bytes/s between two tcp_counters() snapshots."""
+    rates = {}
+    for key, (pid, name, rx, tx) in after.items():
+        _, _, rx0, tx0 = before.get(key, (0, "", 0, 0))
+        rate = rates.setdefault(pid, [name, 0.0, 0.0])
+        rate[1] += max(rx - rx0, 0) / seconds
+        rate[2] += max(tx - tx0, 0) / seconds
+    return rates
+
+
+def quic_owner():
+    """Name of a process talking UDP to port 443 (QUIC, e.g. Chrome or YouTube), which ss cannot count."""
+    for line in run_ss("-uanp").splitlines():
+        parts = line.split()
+        owner = re.search(r'\(\("([^"]+)"', line)
+        if owner and len(parts) > 4 and parts[4].endswith(":443"):
+            return owner[1]
+    return ""
+
+
+def print_net_procs(down_limit, up_limit, sample=1.0):
+    """Prints the programs above either limit over `sample` seconds, plus traffic no TCP socket explains."""
+    before, total0, start = tcp_counters(), internet_bytes(), time.monotonic()
+    time.sleep(sample)
+    after, total1 = tcp_counters(), internet_bytes()
+    seconds = time.monotonic() - start
+    rates = list(tcp_rates(before, after, seconds).values())
+    other_down = (total1[0] - total0[0]) / seconds - sum(r[1] for r in rates)
+    other_up = (total1[1] - total0[1]) / seconds - sum(r[2] for r in rates)
+    owner = quic_owner()
+    rates.append([f"{owner} (QUIC?)" if owner else "unidentified", max(other_down, 0), max(other_up, 0)])
+
+    lines = []
+    for name, down, up in rates:
+        share_down, share_up = down / down_limit, up / up_limit
+        if max(share_down, share_up) >= 1:
+            amount = f"↓{down / MIB:.1f}M" if share_down >= share_up else f"↑{up / MIB:.1f}M"
+            lines.append((max(share_down, share_up), f"{amount}\t{name}"))
+    for _, line in sorted(lines, reverse=True)[:5]:
+        print(line)
 
 
 def is_protected(comm, cmdline):
@@ -106,19 +208,23 @@ def list_candidates(sample=0.5):
                     procs[int(name)] = info
         return procs
 
-    before = snapshot()
+    speed_down, speed_up = internet_speed()
+    net_before, before = tcp_counters(), snapshot()
     time.sleep(sample)
+    net = tcp_rates(net_before, tcp_counters(), sample)
     rows = []
     for pid, (comm, _, ticks, start, rss, _, cmdline) in snapshot().items():
         if pid not in before:
             continue
         cpu = 100 * (ticks - before[pid][2]) / CLK_TCK / sample
         mem = 100 * rss / mem_total
-        if rss < 50 * 1024 * 1024 and cpu < 1:
+        _, down, up = net.get(pid, ("", 0, 0))
+        if rss < 50 * MIB and cpu < 1 and down + up < 100 * 1024:
             continue
+        share = max(100 * down / speed_down if speed_down else 0, 100 * up / speed_up if speed_up else 0)
         age = int(uptime - start / CLK_TCK)
-        rows.append({"pid": pid, "name": comm, "cpu": cpu, "rss": rss, "score": cpu + mem,
-                     "age": format_age(age), "cmd": cmdline or comm})
+        rows.append({"pid": pid, "name": comm, "cpu": cpu, "rss": rss, "net": down + up,
+                     "score": cpu + mem + share, "age": format_age(age), "cmd": cmdline or comm})
     rows.sort(key=lambda r: r["score"], reverse=True)
     rows = rows[:CANDIDATE_LIMIT]
     containers = docker_names()
@@ -220,11 +326,11 @@ def send_signal(pids, sig):
 
 class CandidatesWindow(Gtk.Window):
     # ListStore columns
-    CHECK, NAME, PID, CPU, MEM, AGE, DETAIL, TOOLTIP = range(8)
+    CHECK, NAME, PID, CPU, MEM, NET, AGE, DETAIL, TOOLTIP = range(9)
 
     def __init__(self):
         super().__init__(title="Programs to close")
-        self.set_default_size(820, 460)
+        self.set_default_size(900, 460)
         self.set_keep_above(True)
         self.set_position(Gtk.WindowPosition.CENTER)
 
@@ -235,14 +341,14 @@ class CandidatesWindow(Gtk.Window):
         hint.set_line_wrap(True)
         box.pack_start(hint, False, False, 0)
 
-        self.store = Gtk.ListStore(bool, str, int, str, str, str, str, str)
+        self.store = Gtk.ListStore(bool, str, int, str, str, str, str, str, str)
         view = Gtk.TreeView(model=self.store)
         view.set_tooltip_column(self.TOOLTIP)
         toggle = Gtk.CellRendererToggle()
         toggle.connect("toggled", self.on_toggled)
         view.append_column(Gtk.TreeViewColumn("", toggle, active=self.CHECK))
         for title, col in (("Program", self.NAME), ("PID", self.PID), ("CPU", self.CPU),
-                           ("Memory", self.MEM), ("Running", self.AGE), ("Details", self.DETAIL)):
+                           ("Memory", self.MEM), ("Internet", self.NET), ("Running", self.AGE), ("Details", self.DETAIL)):
             cell = Gtk.CellRendererText()
             if col == self.DETAIL:
                 cell.set_property("ellipsize", 3)  # Pango.EllipsizeMode.END
@@ -272,7 +378,8 @@ class CandidatesWindow(Gtk.Window):
         for r in list_candidates():
             tooltip = GLib.markup_escape_text(f"{r['detail']}\n\nFolder: {r['cwd'] or '?'}\n{r['cmd'][:400]}")
             self.store.append([False, r["name"], r["pid"], f"{r['cpu']:.0f}%",
-                               f"{r['rss'] / 1024 ** 3:.2f} GiB", r["age"], r["detail"], tooltip])
+                               f"{r['rss'] / 1024 ** 3:.2f} GiB",
+                               f"{r['net'] / MIB:.1f} MB/s" if r["net"] >= 1024 else "", r["age"], r["detail"], tooltip])
 
     def on_toggled(self, _cell, path):
         self.store[path][self.CHECK] = not self.store[path][self.CHECK]
@@ -294,8 +401,8 @@ def level(value, threshold):
     return "warn" if value >= threshold else "ok"
 
 
-def column(title, value, threshold, procs, detail):
-    lvl = level(value, threshold)
+def column(title, value, threshold, procs, detail, lvl=None):
+    lvl = lvl or level(value, threshold)
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
     box.get_style_context().add_class("col")
 
@@ -336,13 +443,25 @@ def main():
         show_candidates()
         Gtk.main()
         return
+    if sys.argv[1:2] == ["--net-procs"]:
+        print_net_procs(int(sys.argv[2]), int(sys.argv[3]))
+        return
 
     cpu, cpu_thr, cpu_procs, mem, mem_thr, mem_procs, mem_detail = sys.argv[1:8]
     cpu, cpu_thr, mem, mem_thr = int(cpu), int(cpu_thr), int(mem), int(mem_thr)
 
     cpu_col, cpu_lvl = column("Processor", cpu, cpu_thr, cpu_procs, f"threshold {cpu_thr}%")
     mem_col, mem_lvl = column("Memory", mem, mem_thr, mem_procs, mem_detail)
-    worst = max((cpu_lvl, mem_lvl), key=["ok", "warn", "crit"].index)
+    cols = [cpu_col, mem_col]
+    levels = [cpu_lvl, mem_lvl]
+    if len(sys.argv) > 8:
+        net, net_procs, net_detail = int(sys.argv[8]), sys.argv[9], sys.argv[10]
+        # Network is only a problem when a program is over the limit; red when the line is also full
+        net_lvl = ("crit" if net >= CRITICAL else "warn") if net_procs else "ok"
+        net_col, _ = column("Internet", net, 0, net_procs, net_detail, net_lvl)
+        cols.append(net_col)
+        levels.append(net_lvl)
+    worst = max(levels, key=["ok", "warn", "crit"].index)
 
     provider = Gtk.CssProvider()
     provider.load_from_data(CSS.replace(b"@accent", COLORS[worst].encode()))
@@ -359,11 +478,12 @@ def main():
     win.set_type_hint(Gdk.WindowTypeHint.NOTIFICATION)
 
     columns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
-    columns.pack_start(cpu_col, True, True, 0)
-    sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
-    sep.get_style_context().add_class("sep")
-    columns.pack_start(sep, False, False, 0)
-    columns.pack_start(mem_col, True, True, 0)
+    for i, col in enumerate(cols):
+        if i:
+            sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+            sep.get_style_context().add_class("sep")
+            columns.pack_start(sep, False, False, 0)
+        columns.pack_start(col, True, True, 0)
 
     def open_candidates(_button):
         GLib.source_remove(timer)

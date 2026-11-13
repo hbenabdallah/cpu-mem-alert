@@ -1,14 +1,30 @@
 # cpu-mem-alert
 
-A small Linux desktop monitor that pops up an alert when CPU or memory usage stays high, and helps you find and close the programs causing it.
+A small Linux desktop monitor that pops up an alert when CPU or memory usage stays high, or when a program eats too much of
+your internet connection, and helps you find and close the programs causing it.
 
 ## Alert popup
 
 ![popup](screenshot.png)
 
-- Two columns: **Processor** (usage + top 5 processes by CPU) and **Memory** (usage, GiB used + top 5 processes by RAM).
+- Three columns: **Processor** (usage + top 5 processes by CPU), **Memory** (usage, GiB used + top 5 processes by RAM)
+  and **Internet** (how full the connection is + the programs over the per-program limit).
 - Each value is green below the threshold, orange above it, and **red at 95%+**. The border takes the worst color.
 - An alert fires after usage stays above the threshold for 3 samples in a row, then waits 5 minutes before alerting again.
+
+## Internet limit that follows your connection
+
+The per-program limit is a share of your internet speed, not a fixed number: with the default 10%, a 12 MB/s connection
+alerts on any program using more than 1.2 MB/s, a 100 MB/s one only above 10 MB/s. Download and upload are checked
+separately.
+
+- The speed is **learned**: the monitor remembers the fastest download and upload rates it has seen (stored in
+  `~/.cache/cpu-alert/net-speed`). Run a speed test once after installing so it knows your real speed right away.
+- Or set it yourself with `NET_ALERT_SPEED` / `NET_ALERT_UPLOAD_SPEED` (MB/s), e.g. on a connection you rarely fill.
+- The limit never goes below 512 KB/s, so a slow or not-yet-learned speed doesn't flood you with alerts.
+- Traffic is counted per program from its TCP connections (`ss`, no root needed). Traffic it cannot attribute shows as
+  its own row: `chrome (QUIC?)` when a program talks QUIC (UDP, used by Chrome for Google and YouTube), otherwise
+  `unidentified` (e.g. Docker containers, other users).
 - The popup sits in the top-right corner, closes on click, and disappears after 15 seconds.
 
 ## Programs to close
@@ -17,7 +33,7 @@ Click **Show programs to close** in the popup to see what is weighing on your ma
 
 ![programs to close](process-list.png)
 
-- Lists your 15 heaviest processes right now, ranked by live CPU + memory.
+- Lists your 15 heaviest processes right now, ranked by live CPU + memory + share of the internet speed.
 - The **Details** column says what each process actually is:
   - Claude Code, Junie or any dev tool: the **project** it runs in
   - Processes inside Docker: the **container** name
@@ -39,6 +55,7 @@ cpu-alert-popup --candidates
 ## Requirements
 
 - Linux with a graphical session and systemd (tested on Ubuntu 22.04, GNOME on Wayland)
+- `ss` from iproute2 (installed by default)
 - Python 3 with GTK3 bindings: `sudo apt install python3-gi gir1.2-gtk-3.0`
 - XWayland when running on Wayland (enabled by default on GNOME)
 
@@ -71,7 +88,14 @@ curl -fsSL https://raw.githubusercontent.com/hbenabdallah/cpu-mem-alert/main/ins
 Show the popup with sample values:
 
 ```bash
-~/.local/bin/cpu-alert-popup 97 75 $'97.0%\tphp' 82 75 $'3.2G\tphpstorm' "26 / 31 GiB used"
+~/.local/bin/cpu-alert-popup 97 75 $'97.0%\tphp' 82 75 $'3.2G\tphpstorm' "26 / 31 GiB used" \
+    80 $'↓2.1M\tchrome' $'↓9.6 ↑0.2 of ~12.0 / 1.5 MB/s\nlimit ↓1.2 ↑0.5 MB/s per program'
+```
+
+Check which programs are over a given limit right now (bytes/s for download and upload):
+
+```bash
+~/.local/bin/cpu-alert-popup --net-procs 1000000 500000
 ```
 
 Or trigger a real alert: run a quick monitor in one terminal and load every core in another.
@@ -97,5 +121,9 @@ Set these environment variables in the service (`systemctl --user edit cpu-alert
 | `CPU_ALERT_SUSTAIN` | 3 | High samples in a row before alerting |
 | `CPU_ALERT_COOLDOWN` | 300 | Seconds between two alerts |
 | `CPU_ALERT_POPUP_TIMEOUT` | 15 | Seconds the popup stays on screen |
+| `NET_ALERT_PERCENT` | 10 | Share of the internet speed one program may use |
+| `NET_ALERT_MIN_KB` | 512 | Per-program limit never goes below this (KB/s) |
+| `NET_ALERT_SPEED` | learned | Download speed in MB/s, instead of the fastest rate seen |
+| `NET_ALERT_UPLOAD_SPEED` | learned | Upload speed in MB/s, instead of the fastest rate seen |
 
 Logs: `journalctl --user -u cpu-alert -f`

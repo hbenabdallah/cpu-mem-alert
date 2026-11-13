@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
-# Desktop popup when total CPU or memory usage stays above a threshold.
-# The popup shows a Processor column and a Memory column; it turns red at CPU_ALERT_CRITICAL.
+# Desktop popup when total CPU or memory usage stays above a threshold, or when a program uses
+# more than NET_ALERT_PERCENT of the internet speed.
+# The popup shows Processor, Memory and Internet columns; it turns red at CPU_ALERT_CRITICAL.
 # Env: CPU_ALERT_THRESHOLD (%, default 75), MEM_ALERT_THRESHOLD (%, default 75),
 #      CPU_ALERT_CRITICAL (%, default 95), CPU_ALERT_INTERVAL (s, default 5),
-#      CPU_ALERT_SUSTAIN (consecutive samples, default 3), CPU_ALERT_COOLDOWN (s, default 300)
+#      CPU_ALERT_SUSTAIN (consecutive samples, default 3), CPU_ALERT_COOLDOWN (s, default 300),
+#      NET_ALERT_PERCENT (% of the speed one program may use, default 10),
+#      NET_ALERT_MIN_KB (per-program limit floor in KB/s, default 512),
+#      NET_ALERT_SPEED / NET_ALERT_UPLOAD_SPEED (MB/s, default: learned from the fastest rate seen)
 
 THRESHOLD=${CPU_ALERT_THRESHOLD:-75}
 MEM_THRESHOLD=${MEM_ALERT_THRESHOLD:-75}
 INTERVAL=${CPU_ALERT_INTERVAL:-5}
 SUSTAIN=${CPU_ALERT_SUSTAIN:-3}
 COOLDOWN=${CPU_ALERT_COOLDOWN:-300}
+NET_PERCENT=${NET_ALERT_PERCENT:-10}
+NET_MIN=$((${NET_ALERT_MIN_KB:-512} * 1024))
 POPUP="$(dirname "$(readlink -f "$0")")/cpu-alert-popup"
+SPEED_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/cpu-alert/net-speed"
 
 read_cpu() {
     read -r _ user nice system idle iowait irq softirq steal _ < /proc/stat
@@ -23,7 +30,24 @@ read_mem() {
          END {printf "%d %d %d\n", 100 * (t - a) / t, (t - a) / 1024, t / 1024}' /proc/meminfo
 }
 
+# Prints: received_bytes sent_bytes on the interface of the lowest-metric default route
+read_net() {
+    awk 'NR == FNR { if (FNR > 1 && $2 == "00000000" && (iface == "" || $7 < metric)) { iface = $1; metric = $7 }; next }
+         { split($0, p, ":"); name = p[1]; gsub(/ /, "", name)
+           if (name == iface) { split(p[2], f, " "); rx = f[1]; tx = f[9] } }
+         END { printf "%.0f %.0f\n", rx, tx }' /proc/net/route /proc/net/dev
+}
+
+mib_to_bytes() { awk -v v="$1" 'BEGIN { printf "%.0f", v * 1048576 }'; }
+
+# Fastest rates seen so far stand in for the internet speed unless it is set by hand
+read -r peak_down peak_up 2>/dev/null < "$SPEED_FILE" || { peak_down=0 peak_up=0; }
+mkdir -p "$(dirname "$SPEED_FILE")"
+
 read -r prev_busy prev_idle < <(read_cpu)
+read -r prev_rx prev_tx < <(read_net)
+prev_time=${EPOCHREALTIME//[!0-9]/}
+net_hits=0
 cpu_hits=0
 mem_hits=0
 last_alert=0
@@ -37,16 +61,48 @@ while sleep "$INTERVAL"; do
     usage=$((100 * d_busy / d_total))
     read -r mem_usage mem_used mem_total < <(read_mem)
 
+    read -r rx tx < <(read_net)
+    time_us=${EPOCHREALTIME//[!0-9]/}
+    elapsed_us=$((time_us - prev_time))
+    down=$(((rx - prev_rx) * 1000000 / elapsed_us)) up=$(((tx - prev_tx) * 1000000 / elapsed_us))
+    ((down < 0)) && down=0
+    ((up < 0)) && up=0
+    prev_rx=$rx prev_tx=$tx prev_time=$time_us
+    if ((down > peak_down || up > peak_up)); then
+        ((down > peak_down)) && peak_down=$down
+        ((up > peak_up)) && peak_up=$up
+        echo "$peak_down $peak_up" > "$SPEED_FILE"
+    fi
+    speed_down=$peak_down speed_up=$peak_up
+    [[ -n $NET_ALERT_SPEED ]] && speed_down=$(mib_to_bytes "$NET_ALERT_SPEED")
+    [[ -n $NET_ALERT_UPLOAD_SPEED ]] && speed_up=$(mib_to_bytes "$NET_ALERT_UPLOAD_SPEED")
+    down_limit=$((speed_down * NET_PERCENT / 100)) up_limit=$((speed_up * NET_PERCENT / 100))
+    ((down_limit < NET_MIN)) && down_limit=$NET_MIN
+    ((up_limit < NET_MIN)) && up_limit=$NET_MIN
+    net_usage=$((speed_down > 0 ? 100 * down / speed_down : 0))
+    ((speed_up > 0 && 100 * up / speed_up > net_usage)) && net_usage=$((100 * up / speed_up))
+
+    # Per-program rates cost a 1 s measurement, so only take it when the total could be over a limit
+    net_procs=""
+    if ((down >= down_limit || up >= up_limit)); then
+        net_procs=$("$POPUP" --net-procs "$down_limit" "$up_limit")
+    fi
+
     if ((usage >= THRESHOLD)); then cpu_hits=$((cpu_hits + 1)); else cpu_hits=0; fi
     if ((mem_usage >= MEM_THRESHOLD)); then mem_hits=$((mem_hits + 1)); else mem_hits=0; fi
+    if [[ -n $net_procs ]]; then net_hits=$((net_hits + 1)); else net_hits=0; fi
 
     now=$(date +%s)
-    if ((cpu_hits >= SUSTAIN || mem_hits >= SUSTAIN)) && ((now - last_alert >= COOLDOWN)); then
+    if ((cpu_hits >= SUSTAIN || mem_hits >= SUSTAIN || net_hits >= SUSTAIN)) && ((now - last_alert >= COOLDOWN)); then
         cpu_procs=$(ps -eo %cpu,comm --sort=-%cpu --no-headers | head -5 | awk '{printf "%s%%\t%s\n", $1, $2}')
         mem_procs=$(ps -eo rss,comm --sort=-rss --no-headers | head -5 | awk '{printf "%.1fG\t%s\n", $1 / 1048576, $2}')
         mem_detail=$(awk -v u="$mem_used" -v t="$mem_total" 'BEGIN {printf "%.1f / %.1f GiB used", u / 1024, t / 1024}')
-        "$POPUP" "$usage" "$THRESHOLD" "$cpu_procs" "$mem_usage" "$MEM_THRESHOLD" "$mem_procs" "$mem_detail" &
-        echo "$(date '+%F %T') CPU ${usage}% MEM ${mem_usage}%"$'\n'"$cpu_procs"$'\n'"$mem_procs"
+        net_detail=$(awk -v d="$down" -v u="$up" -v sd="$speed_down" -v su="$speed_up" -v dl="$down_limit" -v ul="$up_limit" \
+            'BEGIN { m = 1048576; printf "↓%.1f ↑%.1f of ~%.1f / %.1f MB/s\nlimit ↓%.1f ↑%.1f MB/s per program",
+                     d / m, u / m, sd / m, su / m, dl / m, ul / m }')
+        "$POPUP" "$usage" "$THRESHOLD" "$cpu_procs" "$mem_usage" "$MEM_THRESHOLD" "$mem_procs" "$mem_detail" \
+            "$net_usage" "$net_procs" "$net_detail" &
+        echo "$(date '+%F %T') CPU ${usage}% MEM ${mem_usage}% NET ${net_usage}%"$'\n'"$cpu_procs"$'\n'"$mem_procs"$'\n'"$net_procs"
         last_alert=$now
     fi
 done
